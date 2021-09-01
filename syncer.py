@@ -154,6 +154,7 @@ class QuteFoxClient():
             qsess = session_list.sort(lambda x: x[0])[-1]
         else:
             qsess = QUTEBROSER_DATA_DIR/'sessions/default.yml'
+        logger.info('Uploading qutebrowser session ' + qsess.name)
         with open(qsess) as qsess:
             qsess_yaml = qsess.read()
             qute_session = yaml.safe_load(qsess_yaml)
@@ -175,6 +176,7 @@ class QuteFoxClient():
                     'title': last_page['title'],
                     'urlHistory': [last_page['url']]
                 })
+        logger.debug('Session converted in BSO record')
         # rec_id = sha1(bytes(str(tabs), 'utf-8')).hexdigest()
         tab_object = {
             'id': self.device_id,
@@ -183,6 +185,7 @@ class QuteFoxClient():
         }
         self.sync_client.post_record(
             'tabs', tab_object, encrypt=True)
+        logger.debug('Session record posted to SyncServer')
 
 
 def main():
