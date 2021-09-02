@@ -5,7 +5,7 @@ import os
 import logging
 import hashlib
 import math
-import requests
+import subprocess
 from pathlib import Path
 from datetime import datetime
 from syncclient import client
@@ -194,6 +194,52 @@ class QuteFoxClient():
             'tabs', tab_object, encrypt=True)
         logger.debug('Session record posted to SyncServer')
 
+    def reload_qutebrowser_bookmarks(self):
+        reload_filename = Path(__file__).parent/'util/bookmark_reload.py'
+        subprocess.run(['qutebrowser',
+                        f':debug-pyeval --file {reload_filename}'])
+
+    def download_ff_bookmarks(self, folder_id):
+        ff_bookmark_raw = self.sync_client.get_records(
+            'bookmarks', parse_data=True, **self.params)
+        ff_bookmark_response = [json.loads(bso.get('payload'))
+                                for bso in ff_bookmark_raw]
+        ff_folders = [bso for bso in ff_bookmark_response
+                      if bso.get('id') == folder_id]
+        if len(ff_folders) != 1:
+            if not ff_folders:
+                raise KeyError('Bookmark folder not found')
+            else:
+                logger.error(
+                    'Multiple matching folders found, critical sync error')
+        folder = ff_folders[0]
+        ff_bookmarks = []
+        for child_id in folder.get('children', []):
+            child = next(bso for bso in ff_bookmark_response
+                         if bso.get('id') == child_id)
+            if child.get('type') == 'bookmark':
+                if not child.get('bmkUri'):
+                    log.warning(
+                        f'bmkUri not found for bookmark record {child_id}')
+                    continue
+                ff_bookmarks.append(
+                    (child.get('bmkUri'), child.get('title', '')))
+        logger.info(f'Gotten {len(ff_bookmarks)} Firefox bookmarks')
+        bookfile = QUTEBROSER_CONFIG_DIR/'bookmarks/urls'
+        qute_bookmarks = []
+        with open(bookfile) as f:
+            for line in f:
+                url, *title = line.split(' ')
+                title = ' '.join(title)
+                qute_bookmarks.append((url, title))
+        new_bookmark_lines = [' '.join(b) for b in ff_bookmarks
+                              if b not in qute_bookmarks]
+        logger.info(f'Updating {len(new_bookmark_lines)} bookmarks')
+        with open(bookfile, 'a') as f:
+            f.write('\n'.join(new_bookmark_lines))
+        logger.info('Reloading qutebrowser bookmarks (hacky, might not work)')
+        self.reload_qutebrowser_bookmarks()
+
     def upload_qute_bookmarks(self,
                               parent={'id': 'menu', 'name': 'menu'},
                               folder_name='qutebrowser'):
@@ -312,6 +358,7 @@ def main():
                         choices=['qutebrowser', 'firefox'],
                         help='Only sync one way. ')
     parser.add_argument('--bookmark-folder-name', dest='bookmark_folder_name')
+    parser.add_argument('--bookmark-folder-id', dest='bookmark_folder_id')
     parser.add_argument('--bookmark-folder-parent',
                         dest='bookmark_folder_parent',
                         nargs=2, metavar=('ID', 'NAME'))
@@ -335,7 +382,11 @@ def main():
                 'id': args.bookmark_folder_parent[0],
                 'name': args.bookmark_folder_parent[1]
             }
-        qutefox.upload_qute_bookmarks(**upload_bookmark_args)
+        download_bookmark_args = {}
+        if args.bookmark_folder_id:
+            download_bookmark_args['folder_id'] = args.bookmark_folder_id
+        # qutefox.upload_qute_bookmarks(**upload_bookmark_args)
+        qutefox.download_ff_bookmarks(**download_bookmark_args)
 
 
 if __name__ == "__main__":
