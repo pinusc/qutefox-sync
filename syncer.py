@@ -5,6 +5,7 @@ import os
 import logging
 import hashlib
 import math
+import requests
 from pathlib import Path
 from datetime import datetime
 from syncclient import client
@@ -193,9 +194,21 @@ class QuteFoxClient():
             'tabs', tab_object, encrypt=True)
         logger.debug('Session record posted to SyncServer')
 
-    def upload_qute_bookmarks(self):
-        folder_name = 'qutebrowser'
+    def upload_qute_bookmarks(self,
+                              parent={'id': 'menu', 'name': 'menu'},
+                              folder_name='qutebrowser'):
+        """
+        Args:
+            folder_name: the name of the folder to save qutebrowser's bookmarks
+                into. This will be a child of parent
+            parent: a dict with keys 'name' and 'id', directing where the
+                folder containing synced bookmarks will be created/updated.
+
+        """
+        if not (parent.get('id') or parent.get('name')):
+            raise ValueError("'parent' must contain both 'id' and 'name'")
         timenow = math.floor(datetime.now().timestamp() * 1000)
+        folder_id = hashlib.sha1(folder_name.encode('utf-8')).hexdigest()[:10]
 
         # obtain existing bookmark records and check if a directory
         # already exists from previous sync. Store it in ff_folder_bso
@@ -203,24 +216,28 @@ class QuteFoxClient():
             'bookmarks', parse_data=True, **self.params)
         ff_bookmarks = [json.loads(bso['payload'])
                         for bso in ff_bookmark_response]
+        ff_bookmark_ids = [bso.get('id') for bso in ff_bookmarks]
         folder_match = [bso for bso in ff_bookmarks
                         if bso.get('type') == 'folder'
-                        and bso.get('title') == folder_name]
+                        and bso.get('title') == folder_name
+                        and bso.get('parentid') == parent['id']]
         if len(folder_match) > 1:
             logger.warning(
                 f'Multiple directories with same name: {folder_name}')
             # FIXME actually select matching id
-            logger.warning('Selecting the first...')
+            logger.warning(
+                'Searching for matching id or creating a new one...')
+            folder_match = [bso for bso in folder_match
+                            if bso.get('id') == folder_id]
         if folder_match:
             folder_bso = folder_match[0]
             logger.info(
                 f'Found an existing folder record with id {folder_bso["id"]}')
         else:
             folder_bso = {
-                'id': (hashlib.sha1(folder_name.encode('utf-8'))
-                       .hexdigest()[:10]),
-                'parentName': 'menu',
-                'parentid': 'menu',
+                'id': folder_id,
+                'parentName': parent['name'],
+                'parentid': parent['id'],
                 'title': folder_name,
                 'type': 'folder',
                 'dateAdded': timenow
@@ -246,10 +263,15 @@ class QuteFoxClient():
                     'dateAdded': timenow,
                     'tags': []
                 }
-                if bso['id'] not in folder_bso.get('children', []):
+                if bso['id'] not in folder_bso.get('children', []) \
+                        or bso['id'] not in ff_bookmark_ids:
                     bookmarks.append(bso)
+        if not bookmarks:
+            logger.info('All bookmarks up to date!')
+            return
         folder_bso['children'] = folder_bso.get('children', []) \
-            + [b['id'] for b in bookmarks]
+            + [b['id'] for b in bookmarks
+               if b not in folder_bso.get('children', [])]
 
         logger.info('Uploading folder')
         response_str = self.sync_client.post_record(
@@ -266,19 +288,10 @@ class QuteFoxClient():
             params = {'batch': batch_id}
             if i == len(bookmarks) - 1:
                 params['commit'] = 'true'
-            self.sync_client.post_record(
+            res = self.sync_client.post_record(
                 'bookmarks', bookmark, encrypt=True, params=params)
-        # FIXME create general post method in client.py
-        # and use that rather than calling _request directly
-        headers = {}
-        __import__('pudb').set_trace()
-        headers['Content-Type'] = 'application/json; charset=utf-8'
-        commit_res = self.sync_client._request('post', '/storage/bookmarks',
-                                               data='[]',
-                                               headers=headers,
-                                               params={'batch': batch_id,
-                                                       'commit': 'true'})
-        logger.info('Upload completed with status: ' + commit_res)
+
+        logger.info('Upload completed with status: ' + res)
 
 
 def main():
@@ -298,6 +311,10 @@ def main():
     parser.add_argument('--one-way-to', dest='one_way_dest',
                         choices=['qutebrowser', 'firefox'],
                         help='Only sync one way. ')
+    parser.add_argument('--bookmark-folder-name', dest='bookmark_folder_name')
+    parser.add_argument('--bookmark-folder-parent',
+                        dest='bookmark_folder_parent',
+                        nargs=2, metavar=('ID', 'NAME'))
 
     args, extra = parser.parse_known_args()
 
@@ -310,7 +327,15 @@ def main():
         if args.one_way_dest is None or args.one_way_dest == 'firefox':
             qutefox.update_ff_session()
     if args.command == 'sync-bookmarks':
-        qutefox.upload_qute_bookmarks()
+        upload_bookmark_args = {}
+        if args.bookmark_folder_name:
+            upload_bookmark_args['folder_name'] = args.bookmark_folder_name
+        if args.bookmark_folder_parent:
+            upload_bookmark_args['parent'] = {
+                'id': args.bookmark_folder_parent[0],
+                'name': args.bookmark_folder_parent[1]
+            }
+        qutefox.upload_qute_bookmarks(**upload_bookmark_args)
 
 
 if __name__ == "__main__":
