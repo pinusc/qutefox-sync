@@ -44,7 +44,8 @@ else:
 
 
 class QuteFoxClient():
-    def __init__(self, login, client_id, token_ttl=3600):
+    def __init__(self, login, client_id, token_ttl=3600,
+                 send_qute_commands=False):
         self.fxa_session = client.get_fxa_session(login)
         logger.debug('FXA session obtained')
         self.client_id = client_id
@@ -152,10 +153,13 @@ class QuteFoxClient():
     def update_ff_session(self, session_name=None):
         if session_name:
             qsess = QUTEBROSER_DATA_DIR/f'sessions/{session_name}.yml'
-        elif userscript is not None:
-            # simple hack to get current session: force qutebrowser to write it
-            # then upload the most recently written session file
-            userscript.run_command('session-save')
+        elif userscript is not None or self.send_qute_commands:
+            if userscript is not None:
+                # simple hack to get current session: force qutebrowser to write it
+                # then upload the most recently written session file
+                userscript.run_command('session-save')
+            elif self.send_qute_commands:
+                self.qutebrowser_command(':session-save')
             session_list = [(f.stat().st_mtime, f)
                             for f in (qsess.data_dir/'sessions').iterdir()]
             qsess = session_list.sort(lambda x: x[0])[-1]
@@ -196,8 +200,10 @@ class QuteFoxClient():
 
     def reload_qutebrowser_bookmarks(self):
         reload_filename = Path(__file__).parent/'util/bookmark_reload.py'
-        subprocess.run(['qutebrowser',
-                        f':debug-pyeval --file {reload_filename}'])
+        self.qutebrowser_command(f':debug-pyeval --file {reload_filename}')
+
+    def qutebrowser_command(self, command):
+        subprocess.run(['qutebrowser', f'{command}'])
 
     def download_ff_bookmarks(self, folder_id):
         ff_bookmark_raw = self.sync_client.get_records(
@@ -238,7 +244,8 @@ class QuteFoxClient():
         with open(bookfile, 'a') as f:
             f.write('\n'.join(new_bookmark_lines))
         logger.info('Reloading qutebrowser bookmarks (hacky, might not work)')
-        self.reload_qutebrowser_bookmarks()
+        if self.send_qute_commands:
+            self.reload_qutebrowser_bookmarks()
 
     def upload_qute_bookmarks(self,
                               parent={'id': 'menu', 'name': 'menu'},
@@ -362,11 +369,15 @@ def main():
     parser.add_argument('--bookmark-folder-parent',
                         dest='bookmark_folder_parent',
                         nargs=2, metavar=('ID', 'NAME'))
+    parser.add_argument('--send-qute-commands', type=bool, default=False,
+                        help='Before/after syncing files, send commands to' +
+                        'qutebrowser to update them')
 
     args, extra = parser.parse_known_args()
 
     qutefox = QuteFoxClient(args.login, args.client_id,
-                            token_ttl=args.token_ttl)
+                            token_ttl=args.token_ttl,
+                            send_qute_commands=args.send_qute_commands)
 
     if args.command == 'sync':
         if args.one_way_dest is None or args.one_way_dest == 'qutebrowser':
