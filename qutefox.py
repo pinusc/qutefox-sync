@@ -41,11 +41,20 @@ else:
     QUTEBROSER_DATA_DIR = Path(os.environ.get("XDG_DATA_HOME"))/'qutebrowser'
     QUTEBROSER_CONFIG_DIR = \
         Path(os.environ.get("XDG_CONFIG_HOME"))/'qutebrowser'
+os.environ['FXA_SESSION_FILE'] = str(
+    Path(os.environ.get("XDG_DATA_HOME"))/'qutefox-sync/fxa_session.json')
 
 
 class QuteFoxClient():
     def __init__(self, login, client_id, token_ttl=3600,
                  send_qute_commands=False):
+        # self.read_qute_history()
+        # return
+        self.init_sync_file()
+        if self.last_sync:
+            logger.info(f'Last sync: {self.last_sync.get("sync_time")}')
+        else:
+            logger.info('Syncing for the first time...')
         self.fxa_session = client.get_fxa_session(login)
         logger.debug('FXA session obtained')
         self.client_id = client_id
@@ -68,6 +77,35 @@ class QuteFoxClient():
             'full': True,
             'decrypt': True,
         }
+        self.send_qute_commands = send_qute_commands
+        self.histdb = sqlite3.connect(QUTEBROSER_DATA_DIR/'history.sqlite')
+
+    def init_sync_file(self):
+        directory = Path(os.environ.get("XDG_DATA_HOME"))/'qutefox-sync'
+        if not directory.is_dir():
+            Path.mkdir(directory)
+        sync_file = directory/'sync-info'
+        last_sync = {}
+        if Path.is_file(sync_file):
+            try:
+                with open(sync_file) as f:
+                    last_sync = json.loads(f.read())
+            except json.JSONDecodeError:
+                logger.error('Sync file empty or corrupt, truncating.')
+                sync_file.write_text('')
+        else:
+            Path.touch(sync_file)
+        # TODO add checks that last_sync is well-formed
+        self.sync_file = sync_file
+        self.last_sync = last_sync
+
+    def update_sync_file(self, key, val):
+        if self.last_sync is None:
+            self.last_sync = {}
+        self.last_sync[key] = val
+        logger.debug(f'Writing sync file at {self.sync_file}')
+        with open(self.sync_file, 'w') as f:
+            f.write(json.dumps(self.last_sync))
 
     def ensure_client_registered(self):
         client_name = 'qutesyncclient'  # FIXME magic string
@@ -258,6 +296,13 @@ class QuteFoxClient():
                 folder containing synced bookmarks will be created/updated.
 
         """
+        bookfile = QUTEBROSER_CONFIG_DIR/'bookmarks/urls'
+        if not bookfile.is_file():
+            logger.error(f'Bookmark file {bookfile} not found, returning.')
+            return
+        if bookfile.stat().st_mtime < \
+                self.last_sync.get('bookmark_upsync_time', 0) and not force:
+            logger.info('Bookmark file older than last sync, not uploading.')
         if not (parent.get('id') or parent.get('name')):
             raise ValueError("'parent' must contain both 'id' and 'name'")
         timenow = math.floor(datetime.now().timestamp() * 1000)
@@ -345,6 +390,7 @@ class QuteFoxClient():
                 'bookmarks', bookmark, encrypt=True, params=params)
 
         logger.info('Upload completed with status: ' + res)
+        self.update_sync_file('bookmark_upsync_time', int(time.time()))
 
 
 def main():
