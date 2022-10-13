@@ -6,6 +6,8 @@ import logging
 import hashlib
 import math
 import subprocess
+import time
+import sqlite3
 from pathlib import Path
 from datetime import datetime
 from syncclient import client
@@ -107,6 +109,93 @@ class QuteFoxClient():
         with open(self.sync_file, 'w') as f:
             f.write(json.dumps(self.last_sync))
 
+    def upload_qute_history(self):
+        lastsynctime = self.last_sync.get('history_upsync_time', 0)
+        entries = {}
+        with self.histdb as db:
+            for row in db.execute(
+                    'SELECT * FROM History WHERE atime > %d;'
+                    % int(lastsynctime)):
+                entry = entries.get(row[0], {})
+                url = row[0]
+                entry['url'] = url
+                entry['title'] = row[1]
+                # we must multiply atime by 1000000 because firefox
+                # uses 16-digit timestamps (microseconds) whereas
+                # qutebrowser uses 10-digit timestamps (seconds)
+                entry['visits'] = entry.get('visits', []) + \
+                    [{'date': int(row[2]) * 10**6,
+                      'type': 1 if row[3] == 0 else 6}]
+                entries[url] = entry
+        hist_res = self.sync_client.get_records(
+            'history', parse_data=True, **self.params)
+        hist_res = [json.loads(bso['payload']) for bso in hist_res]
+        ff_hist_dict = {bso.get('histUri'): bso for bso in hist_res}
+        bso_list = []
+        for url in entries:
+            qute_history_dict = entries[url]
+            qute_visits = qute_history_dict['visits']
+            bso = ff_hist_dict.get(url)
+            if bso is not None and bso.get('visits') is not None:
+                bso['visits'] += [v for v in qute_visits
+                                  if v not in bso['visits']]
+            else:
+                # create BSO from scratch
+                # TODO test if my own generated IDs correspond to FF's
+                bso = {
+                    'id': hashlib.sha1(url.encode('utf-8')).hexdigest()[:10],
+                    'histUri': qute_history_dict['url'],
+                    'title': qute_history_dict['title'],
+                    'visits': qute_visits
+                }
+            bso['visits'].sort(key=lambda d: d.get('date'), reverse=True)
+            bso_list.append(bso)
+        with open('h.json', 'w') as f:
+            f.write(json.dumps(bso_list))
+        res = self.sync_client.post_records('history', bso_list, encrypt=True)
+        __import__('pudb').set_trace()
+        self.update_sync_file('history_upsync_time', time.time())
+
+    def download_ff_history(self):
+        hist_res = self.sync_client.get_records(
+            'history', parse_data=True, **self.params)
+        lastsynctime = self.last_sync.get('history_dsync_time', 0)
+        # FIXME find out what type means
+        tosync = []
+        for record in hist_res:
+            if record.get('modified', -1) > lastsynctime:
+                tosync.append(json.loads(record.get('payload')))
+        db_records = []
+        for bso in tosync:
+            # visit types:
+            # 1: A link was followed.
+            # 2: The URL was typed by the user.
+            # 3: The user followed a bookmark.
+            # 4: Some inner content was loaded.
+            # 5: A permanent redirect was followed.
+            # 6: A temporary redirect was followed.
+            # 7: The URL was downloaded.
+            # 8: User follows a link that was in a frame.
+            if bso.get('histUri') is None:
+                continue
+            visits = [i for i in bso.get('visits', [])
+                      if i.get('type') not in [4, 7, 8]
+                      and int(i.get('date')) > lastsynctime]
+            for visit in visits:
+                # Note: we truncate the date because
+                # FF sync uses microsecond (16-digit) timestamps
+                # and qutebrowser uses second (10-digit) timestamps
+                db_records.append(
+                    (bso.get('histUri'),
+                     bso.get('title', ''),
+                     visit.get('date') // 1000000,
+                     int(visit.get('type') in [5, 6])))
+        with self.histdb as db:
+            for record in db_records:
+                db.execute('INSERT INTO History VALUES (?, ?, ?, ?);', record)
+        logger.info(f"Added {len(db_records)} entries to qutebrowser history")
+        self.update_sync_file('history_dsync_time', time.time())
+
     def ensure_client_registered(self):
         client_name = 'qutesyncclient'  # FIXME magic string
 
@@ -121,7 +210,6 @@ class QuteFoxClient():
         device_id = "29a686c482ca7389604ac02aeb0fc7b3"
         device_id = my_device.get('id')
         # device_id = client.read_session_cache()['uid']
-        print(device_id)
 
         bso = {
             'id': device_id,
@@ -156,16 +244,16 @@ class QuteFoxClient():
                 tab['children'] = []
                 tab['collapsed'] = False
                 tab['tab'] = {'history': [{
-                        'active': True,
-                        'pinned': False,
-                        'scroll-pos': {
-                            'x': 0,
-                            'y': 0
-                        },
-                        'zoom': 1.0,
-                        'title': jsontab['title'],
-                        'url': jsontab['urlHistory'][0]
-                    }
+                    'active': True,
+                    'pinned': False,
+                    'scroll-pos': {
+                        'x': 0,
+                        'y': 0
+                    },
+                    'zoom': 1.0,
+                    'title': jsontab['title'],
+                    'url': jsontab['urlHistory'][0]
+                }
                 ]}
                 tablist.append(tab)
             tabtree = {(i+1): v for (i, v) in enumerate(tablist)}
@@ -193,8 +281,8 @@ class QuteFoxClient():
             qsess = QUTEBROSER_DATA_DIR/f'sessions/{session_name}.yml'
         elif userscript is not None or self.send_qute_commands:
             if userscript is not None:
-                # simple hack to get current session: force qutebrowser to write it
-                # then upload the most recently written session file
+                # simple hack to get current session: force qutebrowser to
+                # save it then upload the most recently written session file
                 userscript.run_command('session-save')
             elif self.send_qute_commands:
                 self.qutebrowser_command(':session-save')
@@ -214,7 +302,8 @@ class QuteFoxClient():
                 tab = window['tree'][tab_n]['tab']
                 if tab == {}:
                     continue
-                tab_hist = sorted(tab['history'], key=lambda x: x['last_visited'])
+                tab_hist = sorted(
+                    tab['history'], key=lambda x: x['last_visited'])
                 if len(tab_hist) == 0:
                     continue
                 last_page = tab_hist[-1]
@@ -263,7 +352,7 @@ class QuteFoxClient():
                          if bso.get('id') == child_id)
             if child.get('type') == 'bookmark':
                 if not child.get('bmkUri'):
-                    log.warning(
+                    logger.warning(
                         f'bmkUri not found for bookmark record {child_id}')
                     continue
                 ff_bookmarks.append(
@@ -287,6 +376,7 @@ class QuteFoxClient():
 
     def upload_qute_bookmarks(self,
                               parent={'id': 'menu', 'name': 'menu'},
+                              force=False,
                               folder_name='qutebrowser'):
         """
         Args:
@@ -342,7 +432,6 @@ class QuteFoxClient():
             }
             logger.info(
                 f'Creating a new folder record with id {folder_bso["id"]}')
-        bookfile = QUTEBROSER_CONFIG_DIR/'bookmarks/urls'
         bookmarks = []
         with open(bookfile) as f:
             for line in f:
@@ -403,7 +492,8 @@ def main():
                         help='The client_id to use for OAuth (mandatory).')
     parser.add_argument('-u', '--user', dest='login',
                         help='Firefox Accounts login (email address).')
-    parser.add_argument('command', choices=['sync', 'sync-bookmarks'])
+    parser.add_argument('command', choices=['sync', 'sync-bookmarks',
+                                            'sync-history', 'noop'])
     parser.add_argument('--token-ttl', dest='token_ttl', type=int,
                         default=3600,
                         help='The validity of the OAuth token in seconds')
@@ -444,6 +534,9 @@ def main():
             download_bookmark_args['folder_id'] = args.bookmark_folder_id
         # qutefox.upload_qute_bookmarks(**upload_bookmark_args)
         qutefox.download_ff_bookmarks(**download_bookmark_args)
+    if args.command == 'sync-history':
+        # qutefox.download_ff_history()
+        qutefox.upload_qute_history()
 
 
 if __name__ == "__main__":
